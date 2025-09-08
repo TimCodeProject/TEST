@@ -1,243 +1,162 @@
 """
-Simple working WebRTC conferencing demo using Flask + Flask-SocketIO (no React/Node).
-Single-file app: run this Python file and open several browser tabs to test.
+Single-file demo: lightweight "conference" using MediaRecorder + HTTP polling (no WebRTC, no WebSockets)
+Adapted for Render free tier (one-file, simple POST/poll flow).
 
-Features:
-- Flask serves a minimal HTML/JS client (vanilla JS)
-- Flask-SocketIO used for signaling (offer/answer/ICE exchange)
-- Mesh topology: every participant creates a peer connection with every other participant
+How it works (high level):
+- Clients record short audio chunks via MediaRecorder (1s slices) and POST them to the server (/upload).
+- Clients poll the server every second (/poll?room=...&since=...), receive new base64-encoded audio chunks from other participants and play them.
+- Server keeps recent chunks in memory per room (short retention window) and forwards them to pollers.
+
+Why this for Render free plan:
+- Render free web services may suspend or disconnect long-lived sockets and have sleep/15-min inactivity behavior that makes WebSocket or persistent WebRTC signaling unreliable on the free plan. This HTTP POST+polling design uses normal short HTTP requests which work well with Render's web services. See Render docs and community threads for notes. (See notes below.)
 
 Limitations:
-- Mesh scales poorly (OK for 2-6 participants)
-- No TURN server configured (use coturn for NAT traversal in production)
+- Not real-time like WebRTC. Expect ~0.5–1.5s latency depending on poll interval.
+- Audio-only (no video) in this demo.
+- Not production-ready: memory kept in RAM, no auth, no HTTPS handling here (Render handles TLS), limited size/caps.
 
-Requirements:
-pip install flask flask-socketio eventlet
+To run locally:
+1) pip install flask
+2) python webrtc_flask_app.py
+3) open http://localhost:5000
 
-Run:
-python webrtc_flask_app.py
-Open http://localhost:5000 and join a room (open multiple tabs or different browsers)
+To deploy on Render:
+- Put this file in a GitHub repo and add requirements.txt with at least `Flask` and `gunicorn`.
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn webrtc_flask_app:app`
+- More: https://render.com/docs/deploy-flask
 
 """
-from flask import Flask, render_template_string, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
-import eventlet
-import uuid
+
+from flask import Flask, request, render_template_string, jsonify
+from threading import Lock, Thread
+import base64
+import time
+import atexit
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
 
-# In-memory room -> { sid: {"name": name} }
+# In-memory storage: { room: [ {ts, user, cid, mime, data_bytes}, ... ] }
 ROOMS = {}
+ROOMS_LOCK = Lock()
 
-INDEX_HTML = """
+# Configuration caps
+MAX_CHUNKS_PER_ROOM = 800            # max stored chunks per room
+CHUNK_RETENTION_SECONDS = 30         # keep chunks for ~30s
+POLL_INTERVAL_SECONDS = 1.0          # clients poll every ~1 second (client-side)
+
+INDEX_HTML = r"""
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Flask WebRTC Demo</title>
-    <style>
-      body { font-family: sans-serif; margin: 12px; }
-      #videos { display:flex; flex-wrap:wrap; gap:8px }
-      video { width: 320px; height: 240px; background: #000 }
-      #controls { margin-bottom:12px }
-    </style>
-  </head>
-  <body>
-    <h2>Flask + WebRTC (vanilla JS) — Simple Conference</h2>
-    <div id="controls">
-      Name: <input id="name" value="User" />
-      Room: <input id="room" value="test" />
-      <button id="joinBtn">Join Room</button>
-      <button id="leaveBtn" disabled>Leave</button>
-    </div>
+<head>
+  <meta charset="utf-8" />
+  <title>Polling-audio conference (Flask single file)</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:12px}
+    #remote { margin-top:10px }
+    .peer { margin-bottom:8px }
+    audio { display:block; margin-top:4px }
+  </style>
+</head>
+<body>
+  <h2>Polling audio conference — lightweight demo</h2>
+  <div>
+    Name: <input id="name" value="User" />
+    Room: <input id="room" value="test" />
+    <button id="join">Join (start mic)</button>
+    <button id="leave" disabled>Leave</button>
+    <div id="status"></div>
+  </div>
 
-    <div id="videos">
-      <div>
-        <div>Local</div>
-        <video id="localVideo" autoplay playsinline muted></video>
-      </div>
-    </div>
+  <div id="remote"></div>
 
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-    <script>
-      const pcConfig = { iceServers: [ { urls: 'stun:stun.l.google.com:19302' } ] };
+  <script>
+    // tiny client that records 1s audio chunks and POSTs them
+    let mediaStream = null;
+    let recorder = null;
+    let recording = false;
+    let pollTimer = null;
+    let lastTs = 0;
+    const cid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
 
-      const socket = io();
-      let localStream = null;
-      let localVideo = document.getElementById('localVideo');
-      let peers = {}; // sid -> { pc, videoEl }
-      let mySid = null;
+    function log(s){ document.getElementById('status').innerText = s }
 
-      document.getElementById('joinBtn').onclick = async () => {
-        const name = document.getElementById('name').value || 'User';
-        const room = document.getElementById('room').value || 'test';
-        await startLocalStream();
-        socket.emit('join', { room, name });
-        document.getElementById('joinBtn').disabled = true;
-        document.getElementById('leaveBtn').disabled = false;
-      };
+    document.getElementById('join').onclick = async () => {
+      const name = document.getElementById('name').value || 'User';
+      const room = document.getElementById('room').value || 'test';
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch(e){ alert('Cannot access microphone: '+e); return; }
 
-      document.getElementById('leaveBtn').onclick = () => {
-        socket.emit('leave');
-        cleanupAllPeers();
-        if (localStream) {
-          localStream.getTracks().forEach(t => t.stop());
-          localStream = null;
-          localVideo.srcObject = null;
-        }
-        document.getElementById('joinBtn').disabled = false;
-        document.getElementById('leaveBtn').disabled = true;
-      };
+      // choose a mime type that's supported
+      let mime = '';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mime = 'audio/webm;codecs=opus';
+      else if (MediaRecorder.isTypeSupported('audio/ogg')) mime = 'audio/ogg';
 
-      async function startLocalStream(){
+      try {
+        recorder = new MediaRecorder(mediaStream, mime ? {mimeType: mime} : undefined );
+      } catch(e){ recorder = new MediaRecorder(mediaStream); }
+
+      recorder.ondataavailable = async (evt) => {
+        if (!evt.data || evt.data.size === 0) return;
+        // send chunk via POST
         try {
-          localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-          localVideo.srcObject = localStream;
-        } catch (e) {
-          alert('Error accessing camera/microphone: ' + e);
-          throw e;
-        }
-      }
+          const fd = new FormData();
+          fd.append('room', room);
+          fd.append('user', name);
+          fd.append('cid', cid);
+          fd.append('blob', evt.data, 'chunk.webm');
+          await fetch('/upload', { method: 'POST', body: fd });
+        } catch(e){ console.error('upload error', e); }
+      };
 
-      socket.on('connect', () => {
-        console.log('socket connected');
-        mySid = socket.id;
-      });
+      recorder.start(1000); // timeslice 1s
+      recording = true;
+      document.getElementById('join').disabled = true;
+      document.getElementById('leave').disabled = false;
+      log('Recording & uploading...');
 
-      socket.on('joined', (data) => {
-        // data: { peers: [{sid, name}, ...], you: {sid, name}, room }
-        console.log('joined', data);
-        mySid = data.you.sid;
-        // Create peer connections to existing peers and initiate offers
-        for (const p of data.peers) {
-          createPeerAndOffer(p.sid);
-        }
-      });
-
-      socket.on('new-participant', (data) => {
-        // someone else joined after us
-        console.log('new participant', data);
-        createPeerAndOffer(data.sid);
-      });
-
-      socket.on('participant-left', (data) => {
-        console.log('left', data);
-        removePeer(data.sid);
-      });
-
-      socket.on('signal', async (data) => {
-        // data: { from, to, signal }
-        const from = data.from;
-        const sig = data.signal;
-        // If we don't have a pc for this peer yet, create it (answerer path)
-        if (!peers[from]) {
-          await createPeerAsAnswer(from);
-        }
-        const pc = peers[from].pc;
-        if (sig.type === 'offer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(sig));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          socket.emit('signal', { to: from, signal: pc.localDescription });
-        } else if (sig.type === 'answer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(sig));
-        } else if (sig.candidate) {
-          try {
-            await pc.addIceCandidate(sig);
-          } catch (e) {
-            console.warn('Error adding ICE candidate', e);
+      // start polling for remote chunks
+      lastTs = 0;
+      pollTimer = setInterval(async () => {
+        try {
+          const url = '/poll?room=' + encodeURIComponent(room) + '&since=' + encodeURIComponent(lastTs);
+          const res = await fetch(url);
+          if (!res.ok) return;
+          const j = await res.json();
+          for (const c of j.chunks){
+            // skip our own chunks
+            if (c.cid === cid) continue;
+            if (c.ts <= lastTs) continue;
+            lastTs = Math.max(lastTs, c.ts);
+            // convert base64->blob
+            const bytes = Uint8Array.from(atob(c.data), ch => ch.charCodeAt(0));
+            const blob = new Blob([bytes.buffer], { type: c.mime });
+            const url = URL.createObjectURL(blob);
+            const container = document.createElement('div'); container.className='peer';
+            const label = document.createElement('div'); label.innerText = c.user + ' — ' + new Date(c.ts*1000).toLocaleTimeString();
+            const audio = document.createElement('audio'); audio.src = url; audio.autoplay = true; audio.controls = false;
+            container.appendChild(label); container.appendChild(audio);
+            document.getElementById('remote').prepend(container);
+            // cleanup after a bit
+            setTimeout(()=>{ try{ URL.revokeObjectURL(url); container.remove(); }catch(e){} }, 20000);
           }
-        }
-      });
+        } catch(e){ console.error('poll error', e); }
+      }, 1000);
+    };
 
-      function createVideoElForPeer(sid) {
-        const videosDiv = document.getElementById('videos');
-        const wrap = document.createElement('div');
-        wrap.id = 'wrap-' + sid;
-        const label = document.createElement('div');
-        label.innerText = 'Peer: ' + sid;
-        const video = document.createElement('video');
-        video.autoplay = true;
-        video.playsInline = true;
-        wrap.appendChild(label);
-        wrap.appendChild(video);
-        videosDiv.appendChild(wrap);
-        return video;
+    document.getElementById('leave').onclick = () => {
+      if (recorder && recording) {
+        try { recorder.stop(); } catch(e) {}
       }
-
-      async function createPeerAndOffer(sid) {
-        if (sid === mySid) return;
-        if (peers[sid]) return; // already exists
-        console.log('createPeerAndOffer', sid);
-        const pc = new RTCPeerConnection(pcConfig);
-        const videoEl = createVideoElForPeer(sid);
-        peers[sid] = { pc, videoEl };
-
-        // add local tracks
-        if (localStream) {
-          for (const track of localStream.getTracks()) {
-            pc.addTrack(track, localStream);
-          }
-        }
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            socket.emit('signal', { to: sid, signal: e.candidate });
-          }
-        };
-
-        pc.ontrack = (e) => {
-          // attach remote stream
-          videoEl.srcObject = e.streams[0];
-        };
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit('signal', { to: sid, signal: pc.localDescription });
-      }
-
-      async function createPeerAsAnswer(sid) {
-        console.log('createPeerAsAnswer', sid);
-        const pc = new RTCPeerConnection(pcConfig);
-        const videoEl = createVideoElForPeer(sid);
-        peers[sid] = { pc, videoEl };
-
-        if (localStream) {
-          for (const track of localStream.getTracks()) {
-            pc.addTrack(track, localStream);
-          }
-        }
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            socket.emit('signal', { to: sid, signal: e.candidate });
-          }
-        };
-
-        pc.ontrack = (e) => {
-          videoEl.srcObject = e.streams[0];
-        };
-
-        return pc;
-      }
-
-      function removePeer(sid) {
-        const entry = peers[sid];
-        if (!entry) return;
-        try { entry.pc.close(); } catch (e) {}
-        const wrap = document.getElementById('wrap-' + sid);
-        if (wrap) wrap.remove();
-        delete peers[sid];
-      }
-
-      function cleanupAllPeers(){
-        for (const sid of Object.keys(peers)) removePeer(sid);
-      }
-
-    </script>
-  </body>
+      if (mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream = null; }
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      document.getElementById('join').disabled = false;
+      document.getElementById('leave').disabled = true;
+      log('Stopped');
+    };
+  </script>
+</body>
 </html>
 """
 
@@ -245,70 +164,68 @@ INDEX_HTML = """
 def index():
     return render_template_string(INDEX_HTML)
 
-@socketio.on('join')
-def handle_join(data):
-    room = data.get('room')
-    name = data.get('name') or 'Anonymous'
-    sid = request.sid
+@app.route('/upload', methods=['POST'])
+def upload():
+    room = request.form.get('room')
+    user = request.form.get('user') or 'Anonymous'
+    cid = request.form.get('cid') or ''
     if not room:
-        emit('error', {'error': 'no room specified'})
-        return
+        return jsonify({'error': 'no room specified'}), 400
 
-    # create room mapping
-    if room not in ROOMS:
-        ROOMS[room] = {}
-    # prepare list of existing peers
-    existing = [{'sid': s, 'name': ROOMS[room][s]['name']} for s in ROOMS[room].keys()]
+    # accept uploaded file 'blob'
+    data = None
+    mime = 'audio/webm'
+    if 'blob' in request.files:
+        f = request.files['blob']
+        data = f.read()
+        mime = f.mimetype or mime
+    else:
+        # try raw JSON base64
+        j = request.get_json(silent=True)
+        if j and 'data' in j:
+            data = base64.b64decode(j['data'])
+            mime = j.get('mime', mime)
 
-    # add this user
-    ROOMS[room][sid] = {'name': name}
-    join_room(room)
+    if not data:
+        return jsonify({'error': 'no blob data'}), 400
 
-    # notify the joining client about existing peers and itself
-    emit('joined', { 'peers': existing, 'you': {'sid': sid, 'name': name}, 'room': room })
+    chunk = {'ts': time.time(), 'user': user, 'cid': cid, 'mime': mime, 'data': data}
+    with ROOMS_LOCK:
+        if room not in ROOMS:
+            ROOMS[room] = []
+        ROOMS[room].append(chunk)
+        # enforce cap
+        if len(ROOMS[room]) > MAX_CHUNKS_PER_ROOM:
+            ROOMS[room] = ROOMS[room][-MAX_CHUNKS_PER_ROOM:]
+    return jsonify({'ok': True})
 
-    # notify others in room about new participant
-    emit('new-participant', {'sid': sid, 'name': name}, room=room, include_self=False)
+@app.route('/poll')
+def poll():
+    room = request.args.get('room')
+    since = float(request.args.get('since') or 0)
+    if not room:
+        return jsonify({'error': 'no room specified'}), 400
+    out = []
+    with ROOMS_LOCK:
+        if room in ROOMS:
+            for c in ROOMS[room]:
+                if c['ts'] > since:
+                    out.append({'ts': c['ts'], 'user': c['user'], 'cid': c['cid'], 'mime': c['mime'], 'data': base64.b64encode(c['data']).decode('ascii')})
+    return jsonify({'chunks': out, 'now': time.time()})
 
-@socketio.on('leave')
-def handle_leave():
-    sid = request.sid
-    # find room containing sid
-    for room, members in list(ROOMS.items()):
-        if sid in members:
-            name = members[sid]['name']
-            leave_room(room)
-            del members[sid]
-            emit('participant-left', {'sid': sid, 'name': name}, room=room)
-            if len(members) == 0:
-                del ROOMS[room]
-            break
+# background cleaner thread
+def cleaner():
+    while True:
+        with ROOMS_LOCK:
+            for room in list(ROOMS.keys()):
+                ROOMS[room] = [c for c in ROOMS[room] if time.time() - c['ts'] <= CHUNK_RETENTION_SECONDS]
+                if not ROOMS[room]:
+                    del ROOMS[room]
+        time.sleep(3)
 
-@socketio.on('disconnect')
-def handle_disconnect():
-    # same as leave
-    sid = request.sid
-    for room, members in list(ROOMS.items()):
-        if sid in members:
-            name = members[sid]['name']
-            leave_room(room)
-            del members[sid]
-            emit('participant-left', {'sid': sid, 'name': name}, room=room)
-            if len(members) == 0:
-                del ROOMS[room]
-            break
-
-@socketio.on('signal')
-def handle_signal(data):
-    # forward a signaling message to target
-    to = data.get('to')
-    signal = data.get('signal')
-    from_sid = request.sid
-    if not to or not signal:
-        return
-    # send to target only
-    emit('signal', {'from': from_sid, 'signal': signal}, room=to)
+cleaner_thread = Thread(target=cleaner, daemon=True)
+cleaner_thread.start()
 
 if __name__ == '__main__':
-    print('Starting Flask WebRTC demo on http://0.0.0.0:5000')
-    socketio.run(app, host='0.0.0.0', port=5000)
+    # local debug server; in production use gunicorn: gunicorn webrtc_flask_app:app
+    app.run(host='0.0.0.0', port=5000, debug=True)
