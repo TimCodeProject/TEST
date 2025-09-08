@@ -1,51 +1,129 @@
-from flask import Flask, render_template
-from flask_socketio import SocketIO, emit, join_room, leave_room
-import os
+<script>
+const socket = io();
+let localStream;
+let peers = {};
+let myId = null;
+let roomId = null;
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(16)
-socketio = SocketIO(app, cors_allowed_origins="*")
+const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
 
-# хранение участников: room_id -> set(socket.id)
-rooms = {}
+async function startMedia() {
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  document.getElementById("localVideo").srcObject = localStream;
+}
 
-@app.route('/')
-def index():
-    return render_template("index.html")
+async function createPeerConnection(peerId, isOfferer) {
+  if (peers[peerId]) return peers[peerId];
+  const pc = new RTCPeerConnection(config);
+  peers[peerId] = pc;
 
-@socketio.on("join")
-def handle_join(data):
-    room = data["room"]
-    join_room(room)
-    if room not in rooms:
-        rooms[room] = set()
-    # уведомить других
-    for sid in rooms[room]:
-        emit("peer-joined", {"id": request.sid}, room=sid)
-    # отправить список участников новому
-    emit("peers", {"peers": list(rooms[room]), "you": request.sid})
-    rooms[room].add(request.sid)
+  // добавить локальные треки
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-@socketio.on("signal")
-def handle_signal(data):
-    to = data.get("to")
-    emit("signal", data, room=to)
+  // принимать треки
+  pc.ontrack = e => {
+    let vid = document.getElementById("v_" + peerId);
+    if (!vid) {
+      const container = document.createElement("div");
+      container.className = "bg-black rounded overflow-hidden";
+      vid = document.createElement("video");
+      vid.id = "v_" + peerId;
+      vid.autoplay = true;
+      vid.playsInline = true;
+      vid.className = "w-full h-40 object-cover";
+      container.appendChild(vid);
+      document.getElementById("videos").appendChild(container);
+    }
+    vid.srcObject = e.streams[0];
+  };
 
-@socketio.on("leave")
-def handle_leave(data):
-    room = data["room"]
-    leave_room(room)
-    if room in rooms and request.sid in rooms[room]:
-        rooms[room].remove(request.sid)
-        emit("peer-left", {"id": request.sid}, room=room)
+  pc.onicecandidate = e => {
+    if (e.candidate) socket.emit("signal", { to: peerId, candidate: e.candidate });
+  };
 
-@socketio.on("disconnect")
-def handle_disconnect():
-    # убрать из всех комнат
-    for room, members in list(rooms.items()):
-        if request.sid in members:
-            members.remove(request.sid)
-            emit("peer-left", {"id": request.sid}, room=room)
+  if (isOfferer) {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit("signal", { to: peerId, sdp: pc.localDescription });
+  }
 
-if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+  return pc;
+}
+
+document.getElementById("joinBtn").onclick = async () => {
+  roomId = document.getElementById("roomInput").value || "demo";
+  await startMedia();
+  socket.emit("join", { room: roomId });
+  document.getElementById("joinBtn").classList.add("hidden");
+  document.getElementById("leaveBtn").classList.remove("hidden");
+};
+
+document.getElementById("leaveBtn").onclick = () => {
+  socket.emit("leave", { room: roomId });
+  for (let id in peers) peers[id].close();
+  peers = {};
+  // оставить только local video
+  const videos = document.getElementById("videos");
+  videos.innerHTML = `
+    <div class="bg-black rounded overflow-hidden relative">
+      <video id="localVideo" autoplay muted playsinline class="w-full h-64 object-cover"></video>
+      <div class="absolute bottom-2 left-2 bg-black/40 text-white px-2 py-1 rounded text-sm">Вы</div>
+    </div>`;
+  if (localStream) document.getElementById("localVideo").srcObject = localStream;
+  document.getElementById("joinBtn").classList.remove("hidden");
+  document.getElementById("leaveBtn").classList.add("hidden");
+};
+
+// Сигналы
+socket.on("peers", async data => {
+  myId = data.you;
+  for (const id of data.peers) {
+    await createPeerConnection(id, true);
+  }
+});
+
+socket.on("peer-joined", async data => {
+  await createPeerConnection(data.id, true);
+});
+
+socket.on("signal", async data => {
+  const from = data.from;
+  let pc = peers[from];
+  if (!pc) pc = await createPeerConnection(from, false);
+
+  if (data.sdp) {
+    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    if (data.sdp.type === "offer") {
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("signal", { to: from, sdp: pc.localDescription });
+    }
+  }
+  if (data.candidate) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch(e){}
+  }
+
+  if (data.broadcast && data.chat) {
+    const box = document.getElementById("chatBox");
+    box.innerHTML += `<div><b>Участник:</b> ${data.chat}</div>`;
+  }
+});
+
+socket.on("peer-left", data => {
+  const id = data.id;
+  if (peers[id]) peers[id].close();
+  delete peers[id];
+  const el = document.getElementById("v_" + id);
+  if (el) el.remove();
+});
+
+// Чат
+document.getElementById("sendBtn").onclick = () => {
+  const msg = document.getElementById("chatInput").value;
+  if (!msg) return;
+  const box = document.getElementById("chatBox");
+  box.innerHTML += `<div><b>Вы:</b> ${msg}</div>`;
+  document.getElementById("chatInput").value = "";
+  socket.emit("signal", { broadcast: true, chat: msg });
+};
+</script>
