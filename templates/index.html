@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Конференция</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-100">
+  <div class="max-w-6xl mx-auto p-6">
+    <header class="flex justify-between items-center mb-6">
+      <h1 class="text-2xl font-bold">Видеоконференция (Flask + WebRTC)</h1>
+      <div class="flex gap-2">
+        <input id="roomInput" placeholder="ID комнаты" class="px-3 py-2 border rounded"/>
+        <button id="joinBtn" class="bg-blue-500 text-white px-4 py-2 rounded">Войти</button>
+        <button id="leaveBtn" class="hidden bg-red-500 text-white px-4 py-2 rounded">Выйти</button>
+      </div>
+    </header>
+
+    <main class="grid grid-cols-3 gap-6">
+      <!-- Видео -->
+      <section class="col-span-2">
+        <div class="grid grid-cols-2 gap-4" id="videos">
+          <div class="bg-black rounded overflow-hidden relative">
+            <video id="localVideo" autoplay muted playsinline class="w-full h-64 object-cover"></video>
+            <div class="absolute bottom-2 left-2 bg-black/40 text-white px-2 py-1 rounded text-sm">Вы</div>
+          </div>
+        </div>
+
+        <div class="mt-4 flex gap-3">
+          <button id="muteBtn" class="bg-gray-700 text-white px-4 py-2 rounded">🔇 Откл. звук</button>
+          <button id="videoBtn" class="bg-gray-700 text-white px-4 py-2 rounded">📷 Откл. видео</button>
+          <button id="shareBtn" class="bg-gray-700 text-white px-4 py-2 rounded">🖥 Поделиться экраном</button>
+        </div>
+      </section>
+
+      <!-- Чат -->
+      <aside>
+        <div class="bg-white rounded shadow p-4 h-96 flex flex-col">
+          <h2 class="font-semibold mb-2">Чат</h2>
+          <div id="chatBox" class="flex-1 overflow-auto border p-2 mb-2"></div>
+          <div class="flex gap-2">
+            <input id="chatInput" placeholder="Сообщение..." class="flex-1 px-3 py-2 border rounded"/>
+            <button id="sendBtn" class="bg-blue-500 text-white px-3 rounded">Отпр.</button>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+<script>
+const socket = io();
+let localStream;
+let peers = {};
+let roomId = null;
+
+// ICE servers
+const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+async function startMedia() {
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  document.getElementById("localVideo").srcObject = localStream;
+}
+
+async function createPeerConnection(id, isOfferer) {
+  if (peers[id]) return peers[id];
+  const pc = new RTCPeerConnection(config);
+  peers[id] = pc;
+
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.ontrack = e => {
+    let vid = document.getElementById("v_" + id);
+    if (!vid) {
+      const container = document.createElement("div");
+      container.className = "bg-black rounded overflow-hidden";
+      vid = document.createElement("video");
+      vid.id = "v_" + id;
+      vid.autoplay = true;
+      vid.playsInline = true;
+      vid.className = "w-full h-40 object-cover";
+      container.appendChild(vid);
+      document.getElementById("videos").appendChild(container);
+    }
+    vid.srcObject = e.streams[0];
+  };
+
+  pc.onicecandidate = e => {
+    if (e.candidate) socket.emit("signal", { to: id, candidate: e.candidate });
+  };
+
+  if (isOfferer) {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit("signal", { to: id, sdp: pc.localDescription });
+  }
+
+  return pc;
+}
+
+document.getElementById("joinBtn").onclick = async () => {
+  roomId = document.getElementById("roomInput").value || "demo";
+  await startMedia();
+  socket.emit("join", { room: roomId });
+  document.getElementById("joinBtn").classList.add("hidden");
+  document.getElementById("leaveBtn").classList.remove("hidden");
+};
+
+document.getElementById("leaveBtn").onclick = () => {
+  socket.emit("leave", { room: roomId });
+  for (let id in peers) peers[id].close();
+  peers = {};
+  document.getElementById("videos").innerHTML = document.getElementById("videos").children[0].outerHTML;
+  document.getElementById("joinBtn").classList.remove("hidden");
+  document.getElementById("leaveBtn").classList.add("hidden");
+};
+
+socket.on("peers", async data => {
+  for (const id of data.peers) {
+    await createPeerConnection(id, true);
+  }
+});
+
+socket.on("peer-joined", async data => {
+  await createPeerConnection(data.id, true);
+});
+
+socket.on("signal", async data => {
+  const id = data.from || data.to;
+  let pc = peers[data.from] || peers[data.to];
+  if (!pc) pc = await createPeerConnection(data.from, false);
+
+  if (data.sdp) {
+    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    if (data.sdp.type === "offer") {
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("signal", { to: data.from, sdp: pc.localDescription });
+    }
+  }
+  if (data.candidate) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch(e){}
+  }
+});
+
+socket.on("peer-left", data => {
+  const id = data.id;
+  if (peers[id]) peers[id].close();
+  delete peers[id];
+  const el = document.getElementById("v_" + id);
+  if (el) el.remove();
+});
+
+// Управление
+document.getElementById("muteBtn").onclick = () => {
+  localStream.getAudioTracks().forEach(t => t.enabled = !t.enabled);
+};
+document.getElementById("videoBtn").onclick = () => {
+  localStream.getVideoTracks().forEach(t => t.enabled = !t.enabled);
+};
+document.getElementById("shareBtn").onclick = async () => {
+  try {
+    const screen = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    const track = screen.getVideoTracks()[0];
+    for (let id in peers) {
+      const sender = peers[id].getSenders().find(s => s.track.kind === "video");
+      if (sender) sender.replaceTrack(track);
+    }
+    track.onended = () => {
+      const cam = localStream.getVideoTracks()[0];
+      for (let id in peers) {
+        const sender = peers[id].getSenders().find(s => s.track.kind === "video");
+        if (sender) sender.replaceTrack(cam);
+      }
+    };
+  } catch(e){ console.error(e); }
+};
+
+// Чат (упрощённый - через сигналинг)
+document.getElementById("sendBtn").onclick = () => {
+  const msg = document.getElementById("chatInput").value;
+  if (!msg) return;
+  const box = document.getElementById("chatBox");
+  box.innerHTML += `<div><b>Вы:</b> ${msg}</div>`;
+  document.getElementById("chatInput").value = "";
+  socket.emit("signal", { broadcast: true, chat: msg });
+};
+
+socket.on("signal", data => {
+  if (data.broadcast && data.chat) {
+    const box = document.getElementById("chatBox");
+    box.innerHTML += `<div><b>Участник:</b> ${data.chat}</div>`;
+  }
+});
+</script>
+</body>
+</html>
